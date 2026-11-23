@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   Single-entry Windows/MuMu setup, diagnostics, offer listing and optional guided stages.
@@ -285,6 +285,10 @@ try {
     $AndroidAbi = ((& $Adb -s $Serial shell getprop ro.product.cpu.abi) | Out-String).Trim()
     if ($AndroidVersion -and $AndroidSdk -and $AndroidAbi) {
         Show-Status "Android" ("{0} (SDK {1}), ABI {2}" -f $AndroidVersion, $AndroidSdk, $AndroidAbi)
+    }
+    if (-not $env:EPLUS_FRIDA_VERSION -and $AndroidSdk -match '^\d+$' -and [int]$AndroidSdk -ge 36) {
+        $env:EPLUS_FRIDA_VERSION = "17.27.4"
+        Note "Android 16/17 detected (SDK $AndroidSdk); selecting Frida 17.27.4 with Java bridge."
     }
     Note ("Activity lookup: {0}" -f $ActivityMethod)
 

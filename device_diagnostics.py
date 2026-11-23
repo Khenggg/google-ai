@@ -85,11 +85,22 @@ def locate_adb(platform_name: str | None = None) -> str | None:
             / "Netease/MuMu Player 12/shell/adb.exe",
         ]
     else:
+        cache_home = Path(os.environ.get("XDG_CACHE_HOME") or home / ".cache")
+        sdk_roots = [
+            Path(os.environ[key])
+            for key in ("ANDROID_SDK_ROOT", "ANDROID_HOME")
+            if os.environ.get(key)
+        ]
         paths = [
+            Path(__file__).resolve().parent / "platform-tools/adb",
+            cache_home / "oneplus13t/platform-tools/adb",
+            cache_home / "google-ai/platform-tools/adb",
+            *(root / "platform-tools/adb" for root in sdk_roots),
+            home / "Android/Sdk/platform-tools/adb",
             Path("/opt/homebrew/bin/adb"),
             Path("/usr/local/bin/adb"),
+            Path("/usr/bin/adb"),
             home / "Library/Android/sdk/platform-tools/adb",
-            home / "Android/Sdk/platform-tools/adb",
         ]
     return next((str(path) for path in paths if path.is_file()), None)
 
@@ -104,21 +115,32 @@ def _run(adb: str, args: list[str]):
         return None
 
 
-def inspect_connection(platform_name: str | None = None) -> ConnectionDiagnosis:
+def inspect_connection(platform_name: str | None = None, serial: str | None = None) -> ConnectionDiagnosis:
     """Inspect host/Android prerequisites without touching billing or account data."""
     platform_name = platform_name or sys.platform
     mac = platform_name == "darwin"
-    details = [f"Host: {'macOS Terminal' if mac else 'Windows / PowerShell' if platform_name == 'win32' else 'POSIX shell'}"]
+    linux = platform_name.startswith("linux")
+    expected_frida = os.environ.get("EPLUS_FRIDA_VERSION", "").strip() or FRIDA_REQUIRED
+    host_label = (
+        "macOS Terminal" if mac
+        else "Linux / Zorin OS" if linux
+        else "Windows / PowerShell" if platform_name == "win32"
+        else "POSIX shell"
+    )
+    details = [f"Host: {host_label}"]
     try:
         frida = metadata.version("frida")
     except metadata.PackageNotFoundError:
         frida = ""
     details.append(
         f"Frida host: {frida or 'not installed'} "
-        f"(toolkit expects {FRIDA_REQUIRED}; no installation attempted)"
+        f"(toolkit expects {expected_frida}; no installation attempted)"
     )
-    install = ("Install ADB with: brew install android-platform-tools"
-               if mac else "Install Android SDK Platform-Tools or enable MuMu ADB")
+    install = (
+        "Install ADB with: brew install android-platform-tools" if mac
+        else "Install Android SDK Platform-Tools or run sh run-linux.sh" if linux
+        else "Install Android SDK Platform-Tools or enable MuMu ADB"
+    )
     adb = locate_adb(platform_name)
     if not adb:
         return ConnectionDiagnosis(
@@ -148,13 +170,17 @@ def inspect_connection(platform_name: str | None = None) -> ConnectionDiagnosis:
         else:
             fix = "Start MuMu or connect a rooted Android phone, enable USB debugging, then run adb devices."
         return ConnectionDiagnosis("no_online_device", "No authorized Android device", tuple(details), fix)
-    if len(online) != 1:
+    if serial and serial in online:
+        selected = serial
+    elif len(online) == 1:
+        selected = online[0]
+    else:
         details.append(f"Online Android transports: {len(online)}")
         return ConnectionDiagnosis(
             "ambiguous", "Multiple Android transports", tuple(details),
             "Choose one explicit ADB serial in the toolkit. This diagnostic never guesses which account/device to use.",
         )
-    serial = online[0]
+    serial = selected
     details.append(f"Android serial: {_clean(serial)}")
     abi = _run(adb, ["-s", serial, "shell", "getprop", "ro.product.cpu.abi"])
     if abi is not None and abi.returncode == 0:
@@ -181,10 +207,10 @@ def inspect_connection(platform_name: str | None = None) -> ConnectionDiagnosis:
             "missing_google_one", "Android connection found", tuple(details),
             "Install Google One from a trusted source on the selected Android device. Billing was not checked.",
         )
-    if frida != FRIDA_REQUIRED:
+    if frida != expected_frida:
         return ConnectionDiagnosis(
             "frida_mismatch", "Android connection found", tuple(details),
-            "The toolkit uses Frida 16.5.9. Use the platform's existing setup workflow to verify compatibility; no changes were made.",
+            f"The toolkit expects Frida {expected_frida}. Use the platform's existing setup workflow to verify compatibility; no changes were made.",
         )
     return ConnectionDiagnosis(
         "connected", "Basic Android connection found", tuple(details),

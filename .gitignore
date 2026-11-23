@@ -43,6 +43,7 @@ platform-tools/
 __pycache__/
 *.py[cod]
 .venv/
+.venv-frida17/
 venv/
 env/
 .pytest_cache/

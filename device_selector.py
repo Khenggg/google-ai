@@ -31,6 +31,21 @@ def online_serials(adb):
     return online
 
 
+def usb_serials(adb):
+    """Return online ADB serials connected directly over USB."""
+    result = adb_command(adb, "devices", "-l")
+    if result is None or result.returncode != 0:
+        return set()
+    usb = set()
+    for line in result.stdout.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == "device" and any(
+            token.startswith("usb:") for token in fields[2:]
+        ):
+            usb.add(fields[0])
+    return usb
+
+
 def boot_uuid(adb, serial):
     result = adb_command(adb, "-s", serial, "shell", "cat", "/proc/sys/kernel/random/boot_id")
     if result is None or result.returncode != 0:
@@ -51,13 +66,19 @@ def installed_google_one(adb, serial):
                 "package:" in result.stdout)
 
 
-def prefer_alias(serials):
-    # Use emulator-5554 before TCP transports ONLY for proven VM aliases.
+def prefer_alias(serials, *, usb=None):
+    # When prefer_usb supplies known USB transports for a single device's
+    # aliases (e.g. USB serial + ADB over TCP/Wi-Fi), prefer the direct USB
+    # transport so Frida USB matching uses the exact serial.
+    usb_set = usb or set()
     return sorted(serials, key=lambda s: (
-        0 if re.fullmatch(r"emulator-\d+", s) else 1, s))[0]
+        0 if s in usb_set else 1,
+        0 if re.fullmatch(r"emulator-\d+", s) else 1,
+        s,
+    ))[0]
 
 
-def auto_select_device(adb, *, preferred=None, serials=None):
+def auto_select_device(adb, *, preferred=None, serials=None, prefer_usb=False):
     """Return a single serial, or None if there is no safe unique choice."""
     online = list(dict.fromkeys(serials if serials is not None else online_serials(adb)))
     if preferred:
@@ -67,14 +88,20 @@ def auto_select_device(adb, *, preferred=None, serials=None):
     if len(online) == 1:
         return online[0]
 
+    usb = usb_serials(adb) if prefer_usb else set()
     groups = {}
     for serial in online:
         boot = boot_uuid(adb, serial)
         key = "boot:" + boot if boot else "transport:" + serial
         groups.setdefault(key, []).append(serial)
-    representatives = [prefer_alias(group) for group in groups.values()]
+    representatives = [prefer_alias(group, usb=usb) for group in groups.values()]
     if len(representatives) == 1:
         return representatives[0]
+
+    if prefer_usb:
+        usb_candidates = [s for s in representatives if s in usb]
+        if len(usb_candidates) == 1:
+            return usb_candidates[0]
 
     for test in (running_google_one, installed_google_one):
         candidates = [s for s in representatives if test(adb, s)]

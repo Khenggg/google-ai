@@ -26,8 +26,10 @@ FRIDA_VERSION = "16.5.9"
 
 def needs_setup() -> bool:
     """Only install Android Python tooling when the required Frida build is absent."""
+    import os
+    required = os.environ.get("EPLUS_FRIDA_VERSION", "").strip() or FRIDA_VERSION
     try:
-        return importlib.metadata.version("frida") != FRIDA_VERSION
+        return importlib.metadata.version("frida") != required
     except importlib.metadata.PackageNotFoundError:
         return True
 
@@ -180,7 +182,7 @@ MESSAGES = {
     ),
     "frida_missing": (
         "Android instrumentation is not ready",
-        "On macOS, relaunch using run-macos.sh to prepare Frida. Check the Android connection before retrying.",
+        "On Linux/macOS, relaunch using run-linux.sh or run-macos.sh to prepare Frida. Check the Android connection before retrying.",
     ),
     "environment_failed": (
         "Android environment check did not finish",
@@ -306,7 +308,7 @@ def safe_launch_diagnostic(error: Exception) -> str:
     """Classify local launch exceptions without exposing file paths or secrets."""
     message = str(error).lower()
     if isinstance(error, FileNotFoundError):
-        for filename in ("setup_env.py", "run-all.ps1", "macos_runner.py"):
+        for filename in ("setup_env.py", "run-all.ps1", "macos_runner.py", "linux_runner.py"):
             if filename in message:
                 return f"Required toolkit file missing: {filename}. Restore the repository files."
         return "A required local file is missing. Check the toolkit installation."
@@ -328,10 +330,11 @@ def validate_step(step: int) -> int:
 def command_for_step(step: int, repo: Path, shell: str | None = None,
                      account: str | None = None, device: str | None = None) -> list[str]:
     validate_step(step)
-    if sys.platform == "darwin":
-        bridge = repo / "macos_runner.py"
+    if shell is None and (sys.platform == "darwin" or sys.platform.startswith("linux")):
+        runner_name = "macos_runner.py" if sys.platform == "darwin" else "linux_runner.py"
+        bridge = repo / runner_name
         if not bridge.is_file():
-            raise FileNotFoundError("macos_runner.py is missing")
+            raise FileNotFoundError(f"{runner_name} is missing")
         command = [sys.executable, str(bridge), "--step", str(step)]
         # The Textual app shows a separate approval modal for each paid stage.
         # The native adapter requires explicit flags as a second fail-closed gate.

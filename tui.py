@@ -227,6 +227,14 @@ def is_macos_platform() -> bool:
     return sys.platform == "darwin"
 
 
+def is_linux_platform() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def is_posix_native_platform() -> bool:
+    return is_macos_platform() or is_linux_platform()
+
+
 class GoogleAITUI(App[None]):
     TITLE = "ePlus AI Toolkit"
     SUB_TITLE = "ePlus.DEV"
@@ -366,6 +374,8 @@ class GoogleAITUI(App[None]):
         self.repo = repo.resolve()
         self.initial_step = validate_step(selected_step)
         self.macos_mode = is_macos_platform()
+        self.linux_mode = is_linux_platform()
+        self.posix_mode = self.macos_mode or self.linux_mode
         self.start_sequence = start_sequence
         self.debug_visible = initial_debug
         self.busy = False
@@ -622,9 +632,11 @@ class GoogleAITUI(App[None]):
                              "Previous run · select an account and run Step 1 to verify")
         self.set_interval(1, self._refresh_elapsed)
         self.set_interval(5, self._poll_connection)
-        if self.macos_mode:
+        if self.posix_mode:
             self.query_one("#device", Static).update("Device  •  Auto-detect")
             self.query_one("#quick_hint", Static).update(
+                "Check Android (USB / OnePlus 13T) and Google AI offers before any subscription step."
+                if self.linux_mode else
                 "Check Android and Google AI offers before any subscription step."
             )
             self.query_one("#read_only", Static).update(
@@ -703,15 +715,23 @@ class GoogleAITUI(App[None]):
             if isinstance(self.screen, ConnectionNotice):
                 return
             if result.state == "missing_adb":
-                guidance = ("Run Check Device & Offers to prepare ADB on Windows. On macOS, "
-                            "install Android SDK Platform-Tools and reconnect Android.")
+                guidance = (
+                    "Install Android SDK Platform-Tools or relaunch with sh run-linux.sh, then reconnect Android."
+                    if self.linux_mode else
+                    "Run Check Device & Offers to prepare ADB on Windows. On macOS, "
+                    "install Android SDK Platform-Tools and reconnect Android."
+                )
                 title = "ADB not found"
             elif result.state == "adb_error":
                 title = "ADB is not responding"
                 guidance = "Check the ADB installation, then run Check Device & Offers."
             else:
                 title = "Android is not connected"
-                guidance = "Start MuMu, enable ADB debugging and approve any Android authorization prompt. The connection will be checked again automatically."
+                guidance = (
+                    "Connect your Android device over USB, enable USB debugging and approve the authorization prompt. The connection will be checked again automatically."
+                    if self.linux_mode else
+                    "Start MuMu, enable ADB debugging and approve any Android authorization prompt. The connection will be checked again automatically."
+                )
             self.push_screen(ConnectionNotice(title, guidance))
 
     @on(Button.Pressed, "#advanced_toggle")
@@ -1142,7 +1162,7 @@ class GoogleAITUI(App[None]):
         self.query_one("#elapsed", Static).update("Elapsed: 00:00")
         self.query_one("#status_panel").scroll_home(animate=False)
         self.query_one("#activity", Static).update(
-            "Connecting to Android diagnostics..." if self.macos_mode
+            "Connecting to Android diagnostics..." if self.posix_mode
             else "Connecting to MuMu and preparing tools..."
         )
         quick_check = self.query_one("#quickstart", Button)
@@ -1170,7 +1190,7 @@ class GoogleAITUI(App[None]):
         self.query_one("#step_result", Static).update(f"Step {step} · {STAGES[step].label}")
         self._set_workflow(step, "running")
         self._set_status(
-            "Running — check Android if prompted" if self.macos_mode
+            "Running — check Android if prompted" if self.posix_mode
             else "Running — check MuMu if prompted"
         )
         self._set_message("Preparing tools and checking Google Play. Missing dependencies are installed automatically.")
@@ -1206,7 +1226,7 @@ class GoogleAITUI(App[None]):
     @work(thread=True, exclusive=True)
     def run_stage(self, step: int) -> None:
         try:
-            if not self.macos_mode and needs_setup():
+            if not self.posix_mode and needs_setup():
                 self.call_from_thread(self._set_status, "Setting up...")
                 self.call_from_thread(self._set_message,
                                       "Preparing Frida and ADB. You do not need a separate setup command.")
@@ -1436,7 +1456,7 @@ class GoogleAITUI(App[None]):
                     offer_view.write(item)
                 offer_view.display = True
                 self.query_one("#offers_title", Static).display = True
-            if self.macos_mode and isinstance(report, dict):
+            if self.posix_mode and isinstance(report, dict):
                 detected = report.get("detected_play_account")
                 if isinstance(detected, str) and detected:
                     self.query_one("#account", Static).update(

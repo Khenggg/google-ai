@@ -31,8 +31,15 @@ ADB_CANDIDATES = [
     r"C:\Program Files\Netease\MuMu\nx_main\adb.exe",
     os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe"),
     os.path.expandvars(r"%USERPROFILE%\AppData\Local\Android\Sdk\platform-tools\adb.exe"),
+    str(BASE / "platform-tools" / "adb"),
+    os.path.expanduser("~/.cache/oneplus13t/platform-tools/adb"),
+    os.path.expanduser("~/.cache/google-ai/platform-tools/adb"),
+    os.path.expanduser("~/Android/Sdk/platform-tools/adb"),
+    "/usr/local/bin/adb",
+    "/usr/bin/adb",
 ]
 PLATFORM_TOOLS_URL = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
+LINUX_PLATFORM_TOOLS_URL = "https://dl.google.com/android/repository/platform-tools-latest-linux.zip"
 
 
 def step(msg):
@@ -152,6 +159,29 @@ def download_platform_tools() -> str:
 
     die("ADB is still unusable. Close processes locking adb.exe, "
         "or set ADB_PATH to a working SDK platform-tools installation.")
+
+
+def download_linux_platform_tools() -> str:
+    """Download official Linux Android SDK Platform-Tools into per-user cache."""
+    target = user_platform_tools()
+    adb = target / "adb"
+    if adb_is_working(adb):
+        return str(adb)
+    with tempfile.TemporaryDirectory(prefix="google-ai-linux-platform-tools-") as temp_dir:
+        temp_root = Path(temp_dir)
+        archive = temp_root / "platform-tools-linux.zip"
+        with urllib.request.urlopen(LINUX_PLATFORM_TOOLS_URL, timeout=180) as response, open(archive, "wb") as out:
+            shutil.copyfileobj(response, out)
+        with zipfile.ZipFile(archive) as z:
+            if "platform-tools/adb" not in z.namelist():
+                raise RuntimeError("Official Linux platform-tools archive did not contain adb")
+            z.extractall(temp_root)
+        source = temp_root / "platform-tools"
+        shutil.copytree(source, target, dirs_exist_ok=True)
+        adb.chmod(0o755)
+        if adb_is_working(adb):
+            return str(adb)
+    raise RuntimeError("Downloaded Linux ADB could not execute")
 
 
 def find_adb() -> str:

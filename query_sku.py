@@ -1,7 +1,8 @@
 """Query offer metadata for explicit Google Play product IDs.
 
-Usage: python query_sku.py g1.2tb.ai.subs_variant [OTHER_SKUS...]
+Usage: python query_sku.py [--serial SERIAL | --remote HOST:PORT] [SKU...]
 """
+import argparse
 import json
 import sys
 import threading
@@ -12,9 +13,31 @@ import frida
 import ultra0
 
 
+def pick_frida_device(serial: str = "", remote: str = ""):
+    if remote:
+        return frida.get_device_manager().add_remote_device(remote)
+    usb = [d for d in frida.get_device_manager().enumerate_devices() if getattr(d, "type", None) == "usb"]
+    if serial:
+        for dev in usb:
+            if dev.id == serial:
+                return dev
+        raise SystemExit(f"Frida USB device {serial!r} not found")
+    if len(usb) == 1:
+        return usb[0]
+    if len(usb) > 1:
+        ids = ", ".join(d.id for d in usb)
+        raise SystemExit(f"Multiple Frida USB devices found ({ids}); pass --serial")
+    return frida.get_device_manager().add_remote_device("127.0.0.1:27042")
+
+
 def main():
-    skus = sys.argv[1:] or ["g1.2tb.ai.subs_variant"]
-    dev = frida.get_device_manager().add_remote_device("127.0.0.1:27042")
+    parser = argparse.ArgumentParser(description="Query Google Play subscription offer metadata")
+    parser.add_argument("skus", nargs="*", help="Product IDs to query (default: g1.2tb.ai.subs_variant)")
+    parser.add_argument("--serial", default="", help="USB ADB/Frida device serial (e.g. OnePlus 13T)")
+    parser.add_argument("--remote", default="", help="Remote frida-server address (e.g. 127.0.0.1:27042)")
+    args = parser.parse_args()
+    skus = args.skus or ["g1.2tb.ai.subs_variant"]
+    dev = pick_frida_device(serial=args.serial, remote=args.remote)
     pid = 0
     for p in dev.enumerate_processes():
         if "subscriptions.red" in p.name or p.name == "Google One":

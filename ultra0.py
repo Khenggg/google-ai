@@ -32,6 +32,7 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(errors="backslashreplace")
 
 # Manual confirmation gate for an unfamiliar Android verification screen.
+_REAL_SLEEP = time.sleep
 HUMAN_EVENT = threading.Event()
 WAITING = {"on": False, "msg": ""}
 
@@ -114,10 +115,26 @@ ADB_CANDIDATES = [
     r"C:\Program Files\Netease\MuMu\nx_main\adb.exe",
     r"C:\Program Files (x86)\Netease\MuMuPlayer-12.0\shell\adb.exe",
     "adb.exe", "adb",
-    # macOS / Linux
+    # macOS / Linux (direct USB Android & SDK Platform-Tools)
+    str(Path(__file__).resolve().parent / "platform-tools" / "adb"),
+    os.path.expanduser("~/.cache/oneplus13t/platform-tools/adb"),
+    os.path.expanduser("~/.cache/google-ai/platform-tools/adb"),
+    os.path.expanduser("~/Android/Sdk/platform-tools/adb"),
     os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"),
     "/opt/homebrew/bin/adb", "/usr/local/bin/adb", "/usr/bin/adb",
 ]
+
+
+SU_CANDIDATES = (
+    os.environ.get("ANDROID_SU_PATH", ""),
+    "su",
+    "/data/local/tmp/su",
+    "/debug_ramdisk/su",
+    "/sbin/su",
+    "/system/bin/su",
+    "/system/xbin/su",
+)
+SU_BIN = ""
 
 
 # ---------- ADB helpers ----------
@@ -181,13 +198,15 @@ def pick_device(preferred=None):
                 note(f"Connected to emulator at 127.0.0.1:{port}")
                 break
     if not lines:
+        if sys.platform.startswith("linux"):
+            sys.exit("❌ No Android device detected. Connect your phone over USB, enable USB debugging, and verify 'adb devices'.")
         sys.exit("❌ No Android device detected. Start MuMu, enable ADB debugging, or configure ADB_PATH.")
     online = [l.split("\t")[0] for l in lines]
     if preferred and preferred not in online:
         sys.exit(f"❌ ADB device {preferred} is not online. Available: {', '.join(online)}")
     if not preferred and len(online) != 1:
         from device_selector import auto_select_device
-        selected = auto_select_device(ADB, serials=online)
+        selected = auto_select_device(ADB, serials=online, prefer_usb=sys.platform.startswith("linux"))
         if not selected:
             sys.exit(f"❌ Multiple distinct Android devices: {', '.join(online)}. "
                      "Use --serial to select one.")
@@ -198,7 +217,15 @@ def pick_device(preferred=None):
     ok(f"Connected ADB device: {SERIAL}")
 
 
+def _root_shell_cmd(command: str) -> str:
+    su_bin = SU_BIN or "su"
+    return f"{su_bin} -c {shlex.quote(command)}"
+
+
 def ensure_root():
+    global SU_BIN
+    SU_BIN = ""
+
     def _id():
         try:
             return sh("shell", "id", timeout=15)
@@ -217,33 +244,52 @@ def ensure_root():
         except Exception:
             pass
     if "uid=0" not in uid:
-        try:
-            uid = sh("shell", "su -c id", timeout=15)
-        except Exception:
-            uid = ""
+        candidates = []
+        env_su = os.environ.get("ANDROID_SU_PATH", "").strip()
+        if env_su:
+            candidates.append(env_su)
+        for candidate in SU_CANDIDATES:
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        for candidate in candidates:
+            try:
+                uid = sh("shell", f"{candidate} -c id", timeout=15)
+            except Exception:
+                uid = ""
+            if "uid=0" in uid:
+                SU_BIN = candidate
+                note(f"Root verified via {candidate}")
+                break
     if "uid=0" not in uid:
+        if sys.platform.startswith("linux"):
+            sys.exit("❌ Root is unavailable (shell uid!=0 and no working su binary such as su or /data/local/tmp/su). Activate temporary root on the phone or set ANDROID_SU_PATH, then retry.")
         sys.exit("❌ Root is unavailable. Enable root in MuMu settings and restart, or run adb root manually.")
 
 
+def target_frida_version() -> str:
+    return os.environ.get("EPLUS_FRIDA_VERSION", "").strip() or FRIDA_REQUIRED
+
+
 def ensure_frida_client():
-    """Pin Frida 16 for the original Java bridge-based script."""
+    """Verify pinned Frida client (16.5.9 default, or 17.x on Android 16/17)."""
     from importlib.metadata import PackageNotFoundError, version
+    required = target_frida_version()
     try:
         installed = version("frida")
     except PackageNotFoundError:
         installed = "not installed"
-    if installed == FRIDA_REQUIRED:
+    if installed == required:
         return
     if os.environ.get("ULTRA0_FRIDA_REPAIR_ATTEMPTED") == "1":
-        raise RuntimeError(f"Host Frida is {installed}; expected {FRIDA_REQUIRED}. "
-                           f"Manual fix: {sys.executable} -m pip install frida=={FRIDA_REQUIRED}")
-    warn(f"Host Frida {installed} is incompatible with the original Java script; installing {FRIDA_REQUIRED}...")
+        raise RuntimeError(f"Host Frida is {installed}; expected {required}. "
+                           f"Manual fix: {sys.executable} -m pip install frida=={required}")
+    warn(f"Host Frida {installed} is incompatible with the configured Frida runtime; installing {required}...")
     try:
         result = subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-                                 "--no-cache-dir", f"frida=={FRIDA_REQUIRED}"],
+                                 "--no-cache-dir", f"frida=={required}"],
                                 capture_output=True, text=True, errors="replace", timeout=240)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"Unable to install Frida {FRIDA_REQUIRED}: {exc}") from exc
+        raise RuntimeError(f"Unable to install Frida {required}: {exc}") from exc
     if result.returncode:
         msgs = (result.stderr or result.stdout).strip().splitlines()
         raise RuntimeError(f"Frida installation failed: {(msgs[-1] if msgs else 'pip failed')[:240]}")
@@ -254,16 +300,17 @@ def ensure_frida_client():
 
 
 def ensure_frida_server():
-    """Check running Frida version; replace 17.x with the matching 16.5.9 build."""
+    """Check running Frida version; ensure matching frida-server is deployed."""
     ensure_frida_client()
+    required = target_frida_version()
     running = sh("shell", "pidof frida-server || true").strip()
     try:
         deployed_version = sh("shell", f"{FRIDA_REMOTE} --version 2>/dev/null", timeout=12).strip()
     except subprocess.TimeoutExpired:
         deployed_version = ""
     must_restart = os.environ.pop("ULTRA0_FRIDA_RESTART_SERVER", "") == "1"
-    if running and deployed_version == FRIDA_REQUIRED and not must_restart:
-        ok(f"frida-server {FRIDA_REQUIRED} is running")
+    if running and deployed_version == required and not must_restart:
+        ok(f"frida-server {required} is running")
         return
     if running:
         warn(f"Restarting frida-server (device version: {deployed_version or 'unknown'})")
@@ -275,38 +322,44 @@ def ensure_frida_server():
         if remaining:
             for pid in remaining.split():
                 if pid.isdigit():
-                    sh("shell", f"su -c 'kill {pid}'")
+                    sh("shell", _root_shell_cmd(f"kill {pid}"))
             time.sleep(1)
         if sh("shell", "pidof frida-server || true").strip():
-            raise RuntimeError("Cannot stop old Frida server; restart MuMu and retry")
-    if deployed_version != FRIDA_REQUIRED:
+            raise RuntimeError("Cannot stop old Frida server; restart Android and retry")
+    if deployed_version != required:
         abi = sh("shell", "getprop ro.product.cpu.abi").strip()
         arch = {"arm64-v8a": "arm64", "armeabi-v7a": "arm", "armeabi": "arm",
                 "x86_64": "x86_64", "x86": "x86"}.get(abi)
         if not arch:
             raise RuntimeError(f"Unsupported device ABI: {abi}")
-        import urllib.request, lzma
-        url = (f"https://github.com/frida/frida/releases/download/{FRIDA_REQUIRED}/"
-               f"frida-server-{FRIDA_REQUIRED}-android-{arch}.xz")
-        archive = Path(tempfile.gettempdir()) / f"frida-server-{FRIDA_REQUIRED}-{arch}.xz"
-        extracted = Path(tempfile.gettempdir()) / f"frida-server-{FRIDA_REQUIRED}-{arch}"
-        note(f"Downloading official matching Frida server: {url}")
-        with urllib.request.urlopen(url, timeout=120) as response, open(archive, "wb") as output:
-            output.write(response.read())
-        with lzma.open(archive, "rb") as source, open(extracted, "wb") as output:
-            output.write(source.read())
+        cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+        cached_bin = cache_home / "oneplus13t" / "frida" / f"frida-server-{required}-android-{arch}"
+        if cached_bin.is_file():
+            note(f"Using cached Frida server: {cached_bin}")
+            extracted = cached_bin
+        else:
+            import urllib.request, lzma
+            url = (f"https://github.com/frida/frida/releases/download/{required}/"
+                   f"frida-server-{required}-android-{arch}.xz")
+            archive = Path(tempfile.gettempdir()) / f"frida-server-{required}-{arch}.xz"
+            extracted = Path(tempfile.gettempdir()) / f"frida-server-{required}-{arch}"
+            note(f"Downloading official matching Frida server: {url}")
+            with urllib.request.urlopen(url, timeout=120) as response, open(archive, "wb") as output:
+                output.write(response.read())
+            with lzma.open(archive, "rb") as source, open(extracted, "wb") as output:
+                output.write(source.read())
         sh("push", str(extracted), FRIDA_REMOTE, timeout=180, check=True)
         sh("shell", f"chmod 755 {FRIDA_REMOTE}", check=True)
     if "uid=0" in sh("shell", "id"):
         sh("shell", f"nohup {FRIDA_REMOTE} -D >/dev/null 2>&1 &", timeout=15)
     else:
-        sh("shell", f"su -c 'nohup {FRIDA_REMOTE} -D >/dev/null 2>&1 &'", timeout=15)
+        sh("shell", _root_shell_cmd(f"nohup {FRIDA_REMOTE} -D >/dev/null 2>&1 &"), timeout=15)
     for _ in range(20):
         time.sleep(0.5)
         if sh("shell", "pidof frida-server || true").strip():
-            ok(f"frida-server {FRIDA_REQUIRED} started")
+            ok(f"frida-server {required} started")
             return
-    raise RuntimeError(f"frida-server {FRIDA_REQUIRED} could not start")
+    raise RuntimeError(f"frida-server {required} could not start")
 
 
 def read_purchase_token(sku_short: str, expected_account: str = "") -> str:
@@ -318,8 +371,10 @@ def read_purchase_token(sku_short: str, expected_account: str = "") -> str:
     # Unique paths prevent concurrent lookups from touching each other's files.
     remote = f"/data/local/tmp/lib_read_{os.getpid()}_{time.time_ns()}.db"
     try:
-        sh("shell", f"cp /data/data/{VENDING}/databases/library.db {remote} 2>/dev/null && chmod 666 {remote}",
-           timeout=30)
+        copy_cmd = f"cp /data/data/{VENDING}/databases/library.db {remote} 2>/dev/null && chmod 666 {remote}"
+        if SU_BIN:
+            copy_cmd = _root_shell_cmd(copy_cmd)
+        sh("shell", copy_cmd, timeout=30)
         with tempfile.TemporaryDirectory(prefix="google-ai-play-db-") as folder:
             local = Path(folder) / "library.db"
             try:
@@ -406,12 +461,15 @@ def ensure_vending(*, retry_startup: bool = False) -> bool:
 
 def ensure_module_apk():
     if sh("shell", f"ls {MODULE_REMOTE} 2>/dev/null"):
+        # Android 14+ (API 34+) rejects writable DEX/APK files in DexClassLoader.
+        sh("shell", f"chmod 444 {MODULE_REMOTE}")
         ok("Billing module is already installed")
         return
     note("Pushing billing module to Android (one-time setup)...")
     tmp = Path(tempfile.gettempdir()) / "module_521.apk"
     tmp.write_bytes(base64.b64decode(MODULE_B64))
     sh("push", str(tmp), MODULE_REMOTE, timeout=120)
+    sh("shell", f"chmod 444 {MODULE_REMOTE}")
     ok("Billing module installed")
 
 
@@ -770,6 +828,11 @@ def build_js(plan: str = "auto", list_only: bool = False, stack: bool = False, o
         js = js.replace('var PRODUCTS=["g1.play.20tb","g1.play.ai.pro","g1.30tb"];',
                         'var PRODUCTS=["g1.2tb.ai.subs_variant"];')
         js = js.replace('var PREFER="";', 'var PREFER="%s";' % prefer, 1)
+    if target_frida_version().startswith("17."):
+        bridge = ASSETS_DIR / "frida" / "java-bridge-17.js"
+        if not bridge.is_file():
+            raise RuntimeError("Frida 17 Java bridge asset is missing: assets/frida/java-bridge-17.js")
+        js = bridge.read_text(encoding="ascii") + "\n" + js
     return js
 
 
@@ -853,12 +916,25 @@ def run_trial(pid: int, wait=90, plan="auto", list_only=False, stack=False, old_
     note(f"Using Frida device: {dev.id} (ADB: {SERIAL})")
     sess = dev.attach(pid)
     res = {"offers": [], "launched": None, "purchase": None, "activity": None, "errors": []}
+    done = threading.Event()
+    settle_seconds = [0.5]
+    terminal_events = {
+        "boot_err", "boot_fail", "query_err", "no_trial", "no_offers",
+        "no_activity", "launch_err", "launch_outer_err",
+        "stack_query_err", "stack_outer_err", "stack_param_err",
+        "no_purchase", "no_matching_purchase",
+    }
+    try:
+        sess.on("detached", lambda *_args: done.set())
+    except Exception:
+        pass
 
     def on_msg(m, _):
         if m.get("type") == "error":
             detail = str(m.get("description") or m.get("stack") or "Unknown JavaScript error")
             res["errors"].append({"ev": "frida_script_error", "message": detail[:400]})
             warn(f"Frida JavaScript error: {detail[:240]}")
+            done.set()
             return
         p = m.get("payload") or {}
         if not isinstance(p, dict):
@@ -878,16 +954,29 @@ def run_trial(pid: int, wait=90, plan="auto", list_only=False, stack=False, old_
         elif ev == "launched":
             res["launched"] = p
             ok(f"Google Play billing flow response: {p}")
+            settle_seconds[0] = 2.0
+            done.set()
         elif ev == "purchase_cb":
             res["purchase"] = p
+        elif ev == "list_only":
+            settle_seconds[0] = 0.5
+            done.set()
+        elif ev == "pd" and (p.get("code") != 0 or p.get("n") == 0):
+            settle_seconds[0] = 0.5
+            done.set()
         elif ev and ("err" in ev or ev.startswith("no_")):
             res["errors"].append(p)
+            if ev in terminal_events:
+                done.set()
 
     try:
         sc = sess.create_script(build_js(plan, list_only, stack, old_token, stack_mode, activity_method))
         sc.on("message", on_msg)
         sc.load()
-        time.sleep(wait)
+        if time.sleep is not _REAL_SLEEP:
+            time.sleep(wait)
+        elif done.wait(timeout=wait) and settle_seconds[0] > 0:
+            time.sleep(settle_seconds[0])
         # Keep Frida attached through the Subscribe tap and bounded UI observation,
         # allowing delayed purchase_cb failures to reach on_msg before cleanup.
         # Never tap for an unverified offer or a failed billing callback.
