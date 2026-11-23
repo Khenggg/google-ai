@@ -696,42 +696,78 @@ def add_card(card: dict) -> bool:
 
 def current_play_account() -> str:
     """Read the visible account from Play Store; unknown is not an account mismatch."""
-    xml = ui_xml()
-    if f'package="{VENDING}"' not in xml:
-        note("Opening Play Store to verify the account (Google One may be foreground)...")
-        sh("shell", f"am start -n {VENDING}/com.google.android.finsky.activities.MainActivity", timeout=25)
-        time.sleep(3)
+    play_package = f'package="{VENDING}"'
+    email_pattern = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+    saw_play_store = False
+    opened_store = False
+    left_payments_menu = False
+    attempts = 4
+    for attempt in range(attempts):
         xml = ui_xml()
-    if f'package="{VENDING}"' not in xml:
-        warn("Cannot inspect Play Store UI. Open Play Store, tap the profile icon, and retry.")
+        in_play_store = play_package in xml
+        if in_play_store:
+            saw_play_store = True
+            page = list(nodes(xml))
+            profile_button = None
+            for node in page:
+                description = node["desc"]
+                is_profile_button = any(label in description for label in (
+                    "\u8d26\u53f7\u548c\u8bbe\u7f6e", "Account and settings",
+                    "T\u00e0i kho\u1ea3n v\u00e0 ch\u1ebf \u0111\u1ed9 c\u00e0i \u0111\u1eb7t",
+                ))
+                # Prefer an explicit active account over emails in the profile menu.
+                active_label = re.match(
+                    r"^(?:Google Account|T\u00e0i kho\u1ea3n Google|Google \u5e10\u53f7|Google \u8d26\u53f7)\s*[:\uff1a]",
+                    description, re.I,
+                )
+                if active_label or (is_profile_button and description.startswith("Signed in as ")):
+                    active = {value.lower() for value in re.findall(email_pattern, description)}
+                    if len(active) == 1:
+                        return next(iter(active))
+                if profile_button is None and is_profile_button:
+                    profile_button = node
+            if profile_button is not None:
+                break
+            # This is a settings menu inside Play Store, not a checkout prompt.
+            if not left_payments_menu and any(node["text"] == "Payments &amp; subscriptions" for node in page):
+                up = next((node for node in page if node["desc"] == "Navigate up"), None)
+                if up and attempt + 1 < attempts:
+                    tap(up["x"], up["y"])
+                    left_payments_menu = True
+                    time.sleep(1)
+                    continue
+
+        if attempt + 1 == attempts:
+            continue
+        if not opened_store and (not in_play_store or attempt > 0):
+            note("Opening the Play Store home screen to verify the active account...")
+            sh("shell", f"am start -n {VENDING}/com.google.android.finsky.activities.MainActivity", timeout=25)
+            opened_store = True
+            time.sleep(3)
+        else:
+            time.sleep(1)
+    else:
+        if saw_play_store:
+            warn("Play account is not visible to UI automation; check the Play Store profile manually.")
+        else:
+            warn("Cannot inspect Play Store UI. Open Play Store, tap the profile icon, and retry.")
         return ""
 
-    opened_profile = False
-    for n in nodes(xml):
-        # Play Store exposes the active profile on its account button in
-        # some versions. Other signed-in accounts in the expanded menu
-        # must not override that explicit identity.
-        if re.match(r"^(?:Google Account|T\u00e0i kho\u1ea3n Google|Google \u5e10\u53f7|Google \u8d26\u53f7)\s*[:\uff1a]", n["desc"], re.I):
-            active = {value.lower() for value in re.findall(
-                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", n["desc"])}
-            if len(active) == 1:
-                return next(iter(active))
-        if ("\u8d26\u53f7\u548c\u8bbe\u7f6e" in n["desc"] or "Account and settings" in n["desc"]
-                or "T\u00e0i kho\u1ea3n v\u00e0 ch\u1ebf \u0111\u1ed9 c\u00e0i \u0111\u1eb7t" in n["desc"]):
-            tap(n["x"], n["y"])
-            time.sleep(3)
-            opened_profile = True
-            break
+    tap(profile_button["x"], profile_button["y"])
+    time.sleep(3)
+    profile_xml = ui_xml()
+    if play_package not in profile_xml:
+        warn("Play Store was no longer visible after opening the profile.")
+        return ""
+
     # The profile popup may show multiple signed-in Google accounts. Its
     # first email is NOT necessarily the account currently selected for
     # billing. Never infer identity from the first arbitrary UI node.
     emails = set()
-    for n in nodes(ui_xml()):
-        for email in re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-                                n["desc"] + " " + n["text"]):
+    for n in nodes(profile_xml):
+        for email in re.findall(email_pattern, n["desc"] + " " + n["text"]):
             emails.add(email.lower())
-    if opened_profile:
-        sh("shell", "input keyevent 4")
+    sh("shell", "input keyevent 4")
     if len(emails) > 1:
         warn("Multiple Google accounts are visible in Play Store; the active billing "
              "account cannot be identified safely. Select the intended account "
@@ -739,10 +775,6 @@ def current_play_account() -> str:
         return ""
     if not emails:
         warn("Play account is not visible to UI automation; check the Play Store profile manually.")
-        return ""
-    if not opened_profile:
-        warn("Play Store profile was not opened; a visible email does not prove "
-             "which account is active for billing.")
         return ""
     return next(iter(emails))
 

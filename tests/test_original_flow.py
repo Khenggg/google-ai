@@ -188,7 +188,7 @@ class OriginalFlowGuardrails(unittest.TestCase):
 
     def test_play_account_refuses_ambiguous_multi_account_profile(self):
         def fake_nodes(xml):
-            if 'com.android.vending' in xml:
+            if 'PROFILE' not in xml:
                 return [{"desc": "Account and settings", "text": "", "x": 10, "y": 20}]
             return [
                 {"desc": "Primary one@example.com", "text": ""},
@@ -196,7 +196,7 @@ class OriginalFlowGuardrails(unittest.TestCase):
             ]
 
         with patch.object(mod, "ui_xml", side_effect=[
-                 '<node package="com.android.vending"/>', 'PROFILE'
+                 '<node package="com.android.vending"/>', '<node package="com.android.vending">PROFILE</node>'
              ]), \
              patch.object(mod, "nodes", side_effect=fake_nodes), \
              patch.object(mod, "tap"), \
@@ -207,7 +207,7 @@ class OriginalFlowGuardrails(unittest.TestCase):
 
     def test_play_account_accepts_only_one_visible_profile_account(self):
         with patch.object(mod, "ui_xml", side_effect=[
-                 '<node package="com.android.vending"/>', 'PROFILE'
+                 '<node package="com.android.vending"/>', '<node package="com.android.vending">PROFILE</node>'
              ]), \
              patch.object(mod, "nodes", side_effect=[
                  [{"desc": "Account and settings", "text": "", "x": 10, "y": 20}],
@@ -220,15 +220,50 @@ class OriginalFlowGuardrails(unittest.TestCase):
             self.assertEqual(mod.current_play_account(), "one@example.com")
 
     def test_play_account_rejects_email_without_opening_profile(self):
-        with patch.object(mod, "ui_xml", side_effect=[
-                 '<node package="com.android.vending"/>', 'MAIN'
-             ]), \
-             patch.object(mod, "nodes", side_effect=[
-                 [{"desc": "Unrelated label", "text": "", "x": 10, "y": 20}],
-                 [{"desc": "one@example.com", "text": ""}]
-             ]), \
+        page = '<node package="com.android.vending" text="one@example.com" bounds="[0,0][20,40]"/>'
+        with patch.object(mod, "ui_xml", return_value=page) as ui, \
+             patch.object(mod, "tap") as tap, patch.object(mod.time, "sleep"), \
              patch.object(mod, "sh"):
             self.assertEqual(mod.current_play_account(), "")
+        self.assertEqual(ui.call_count, 4)
+        tap.assert_not_called()
+
+    def test_play_account_recognizes_profile_button_after_loading(self):
+        loading = '<node package="com.android.vending" bounds="[0,0][20,40]"/>'
+        ready = ('<node package="com.android.vending" '
+                 'content-desc="Signed in as Test one@example.com&#10;Account and settings." '
+                 'bounds="[0,0][20,40]"/>')
+        with patch.object(mod, "ui_xml", side_effect=[loading, ready]), \
+             patch.object(mod.time, "sleep"), patch.object(mod, "tap") as tap:
+            self.assertEqual(mod.current_play_account(), "one@example.com")
+        tap.assert_not_called()
+
+    def test_play_account_recovers_from_a_play_store_screen_without_a_profile(self):
+        blocked = '<node package="com.android.vending" bounds="[0,0][20,40]"/>'
+        payments = ('<node package="com.android.vending" text="Payments &amp; subscriptions" '
+                    'bounds="[0,0][20,40]"/>'
+                    '<node package="com.android.vending" content-desc="Navigate up" bounds="[0,0][20,40]"/>')
+        home = ('<node package="com.android.vending" content-desc="Google Account: one@example.com" '
+                'bounds="[0,0][20,40]"/>')
+        with patch.object(mod, "ui_xml", side_effect=[blocked, blocked, payments, home]), \
+             patch.object(mod.time, "sleep"), patch.object(mod, "tap") as tap, \
+             patch.object(mod, "sh") as adb:
+            self.assertEqual(mod.current_play_account(), "one@example.com")
+        tap.assert_called_once_with(10, 20)
+        adb.assert_called_once_with(
+            "shell", "am start -n com.android.vending/com.google.android.finsky.activities.MainActivity", timeout=25,
+        )
+
+    def test_play_account_ignores_another_app_after_profile_tap(self):
+        store = ('<node package="com.android.vending" content-desc="Account and settings" '
+                 'bounds="[0,0][20,40]"/>')
+        other = '<node package="com.example.other" text="one@example.com" bounds="[0,0][20,40]"/>'
+        with patch.object(mod, "ui_xml", side_effect=[store, other]), \
+             patch.object(mod.time, "sleep"), patch.object(mod, "tap") as tap, \
+             patch.object(mod, "sh") as adb:
+            self.assertEqual(mod.current_play_account(), "")
+        tap.assert_called_once_with(10, 20)
+        adb.assert_not_called()
 
     def test_offer_tokens_are_never_saved_in_reports(self):
         device = MagicMock()
